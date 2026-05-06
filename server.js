@@ -1,122 +1,128 @@
-const WebSocket = require('ws');
-const server = new WebSocket.Server({ port: process.env.PORT || 8080 });
+var WebSocket = require('ws');
+var server = new WebSocket.Server({ port: process.env.PORT || 8080 });
 
-// rooms: { roomName: Set<ws> }
-const rooms = {};
+var rooms = {}; // roomName -> Set<ws>
 
-function broadcast(room, data, exclude = null) {
+function broadcast(room, data, exclude) {
   if (!rooms[room]) return;
-  const json = JSON.stringify(data);
-  rooms[room].forEach(client => {
+  var json = JSON.stringify(data);
+  rooms[room].forEach(function(client) {
     if (client !== exclude && client.readyState === WebSocket.OPEN) {
       client.send(json);
     }
   });
 }
 
-function getRoomMembers(room) {
-  if (!rooms[room]) return [];
-  return [...rooms[room]].map(c => c.name).filter(Boolean);
+function broadcastAll(room, data) {
+  if (!rooms[room]) return;
+  var json = JSON.stringify(data);
+  rooms[room].forEach(function(client) {
+    if (client.readyState === WebSocket.OPEN) {
+      client.send(json);
+    }
+  });
 }
 
-server.on('connection', (ws) => {
+function getMembers(room) {
+  if (!rooms[room]) return [];
+  var names = [];
+  rooms[room].forEach(function(c) { if (c.name) names.push(c.name); });
+  return names;
+}
+
+server.on('connection', function(ws) {
   ws.room = null;
   ws.name = null;
 
-  ws.on('message', (data) => {
-    let msg;
-    try { msg = JSON.parse(data); } catch { return; }
+  ws.on('message', function(data) {
+    var msg;
+    try { msg = JSON.parse(data); } catch(e) { return; }
 
-    switch (msg.type) {
-
-      case 'join': {
-        // Покидаем предыдущую комнату
-        if (ws.room && rooms[ws.room]) {
-          rooms[ws.room].delete(ws);
-          broadcast(ws.room, {
-            type: 'system',
-            room: ws.room,
-            text: `${ws.name} вышел из комнаты`,
-            name: ws.name,
-            members: getRoomMembers(ws.room)
-          });
-        }
-        ws.room = msg.room;
-        ws.name = msg.name;
-        if (!rooms[msg.room]) rooms[msg.room] = new Set();
-        rooms[msg.room].add(ws);
-        // Уведомить всех о входе
-        broadcast(msg.room, {
+    if (msg.type === 'join') {
+      // Покидаем старую комнату
+      if (ws.room && rooms[ws.room]) {
+        rooms[ws.room].delete(ws);
+        broadcast(ws.room, {
           type: 'system',
-          room: msg.room,
-          text: `${msg.name} подключился`,
-          name: msg.name,
-          members: getRoomMembers(msg.room)
-        }, ws);
-        // Отправить текущему пользователю список участников
-        ws.send(JSON.stringify({
-          type: 'members',
-          room: msg.room,
-          members: getRoomMembers(msg.room)
-        }));
-        break;
-      }
-
-      case 'message': {
-        broadcast(ws.room, {
-          type: 'message',
           room: ws.room,
-          name: ws.name,
-          text: msg.text,
-          time: msg.time,
-          replyTo: msg.replyTo || null,
-          id: msg.id
+          text: ws.name + ' вышел из комнаты',
+          members: getMembers(ws.room)
         });
-        break;
       }
+      ws.room = msg.room;
+      ws.name = msg.name;
+      if (!rooms[msg.room]) rooms[msg.room] = new Set();
+      rooms[msg.room].add(ws);
 
-      case 'file': {
-        broadcast(ws.room, {
-          type: 'file',
-          room: ws.room,
-          name: ws.name,
-          time: msg.time,
-          fileType: msg.fileType, // image/audio/video/file
-          fileName: msg.fileName,
-          fileSize: msg.fileSize,
-          data: msg.data, // base64
-          id: msg.id
-        });
-        break;
-      }
+      // Уведомить остальных о входе
+      broadcast(msg.room, {
+        type: 'system',
+        room: msg.room,
+        text: msg.name + ' подключился',
+        members: getMembers(msg.room)
+      }, ws);
 
-      case 'typing': {
-        broadcast(ws.room, {
-          type: 'typing',
-          room: ws.room,
-          name: ws.name,
-          isTyping: msg.isTyping,
-          isSending: msg.isSending || false
-        }, ws);
-        break;
-      }
+      // Отправить текущему пользователю список участников
+      ws.send(JSON.stringify({
+        type: 'members',
+        room: msg.room,
+        members: getMembers(msg.room)
+      }));
+    }
+
+    else if (msg.type === 'message') {
+      // Рассылаем ВСЕМ включая отправителя — так нет дублей
+      broadcastAll(ws.room, {
+        type: 'message',
+        room: ws.room,
+        name: ws.name,
+        text: msg.text,
+        time: msg.time,
+        replyTo: msg.replyTo || null,
+        id: msg.id
+      });
+    }
+
+    else if (msg.type === 'file') {
+      // Рассылаем ВСЕМ включая отправителя
+      broadcastAll(ws.room, {
+        type: 'file',
+        room: ws.room,
+        name: ws.name,
+        time: msg.time,
+        fileType: msg.fileType,
+        fileName: msg.fileName,
+        fileSize: msg.fileSize,
+        data: msg.data,
+        id: msg.id,
+        replyTo: msg.replyTo || null
+      });
+    }
+
+    else if (msg.type === 'typing') {
+      broadcast(ws.room, {
+        type: 'typing',
+        room: ws.room,
+        name: ws.name,
+        isTyping: msg.isTyping,
+        isSending: msg.isSending || false
+      }, ws);
     }
   });
 
-  ws.on('close', () => {
+  ws.on('close', function() {
     if (ws.room && rooms[ws.room]) {
       rooms[ws.room].delete(ws);
       broadcast(ws.room, {
         type: 'system',
         room: ws.room,
-        text: `${ws.name} вышел из комнаты`,
-        name: ws.name,
-        members: getRoomMembers(ws.room)
+        text: ws.name + ' вышел из комнаты',
+        members: getMembers(ws.room)
       });
     }
   });
 
-  ws.on('error', () => {
+  ws.on('error', function() {
     if (ws.room && rooms[ws.room]) {
       rooms[ws.room].delete(ws);
     }
