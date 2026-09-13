@@ -1,45 +1,73 @@
 var WebSocket = require('ws');
+var fs = require('fs');
+var path = require('path');
+
 var server = new WebSocket.Server({ port: process.env.PORT || 8080 });
 
 var rooms = {};
 var history = {};
-var users = {};        // userId -> ws
-var userNames = {};    // userId -> displayName
-var userHandles = {};  // userId -> @handle
-var handleIndex = {};  // @handle -> userId  (уникальность)
+var users = {};
+var userNames = {};
+var userHandles = {};
+var handleIndex = {};
 var dmHistory = {};
-var MAX_HISTORY = 300;
+var MAX_HISTORY = 200;
+
+var DATA_FILE = path.join(__dirname, 'handles.json');
+
+function loadHandles() {
+  try {
+    if (fs.existsSync(DATA_FILE)) {
+      var d = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
+      handleIndex = d.handleIndex || {};
+      userHandles = d.userHandles || {};
+      console.log('Загружено @username:', Object.keys(handleIndex).length);
+    }
+  } catch(e) { console.log('Ошибка загрузки:', e.message); }
+}
+
+function saveHandles() {
+  try { fs.writeFileSync(DATA_FILE, JSON.stringify({ handleIndex: handleIndex, userHandles: userHandles }), 'utf8'); }
+  catch(e) { console.log('Ошибка сохранения:', e.message); }
+}
+
+setInterval(saveHandles, 30000);
+process.on('SIGTERM', function() { saveHandles(); process.exit(0); });
+process.on('SIGINT', function() { saveHandles(); process.exit(0); });
 
 function dmKey(a, b) { return [a, b].sort().join('::'); }
 
 function broadcast(room, data, exclude) {
   if (!rooms[room]) return;
   var json = JSON.stringify(data);
-  rooms[room].forEach(function(c) {
-    if (c !== exclude && c.readyState === 1) c.send(json);
-  });
+  rooms[room].forEach(function(c) { if (c !== exclude && c.readyState === 1) c.send(json); });
 }
+
 function broadcastAll(room, data) {
   if (!rooms[room]) return;
   var json = JSON.stringify(data);
   rooms[room].forEach(function(c) { if (c.readyState === 1) c.send(json); });
 }
+
 function getMembers(room) {
   if (!rooms[room]) return [];
   var out = [];
   rooms[room].forEach(function(c) { if (c.name) out.push(c.name); });
   return out;
 }
+
 function saveMsg(room, msg) {
   if (!history[room]) history[room] = [];
   history[room].push(msg);
   if (history[room].length > MAX_HISTORY) history[room].shift();
 }
+
 function saveDM(key, msg) {
   if (!dmHistory[key]) dmHistory[key] = [];
   dmHistory[key].push(msg);
   if (dmHistory[key].length > MAX_HISTORY) dmHistory[key].shift();
 }
+
 function sendTo(userId, data) {
   var ws = users[userId];
   if (ws && ws.readyState === 1) ws.send(JSON.stringify(data));
@@ -57,54 +85,39 @@ server.on('connection', function(ws) {
 
     switch (msg.type) {
 
-      // ── РЕГИСТРАЦИЯ ──
       case 'register':
         ws.userId = msg.userId;
         ws.name = msg.name;
         users[msg.userId] = ws;
         userNames[msg.userId] = msg.name;
-        // Восстанавливаем хендл если был
         if (userHandles[msg.userId]) {
           ws.handle = userHandles[msg.userId];
           ws.send(JSON.stringify({ type: 'handle_ok', handle: ws.handle }));
         }
         break;
 
-      // ── РЕГИСТРАЦИЯ @HANDLE ──
       case 'set_handle':
         var h = (msg.handle || '').toLowerCase().replace(/[^a-zа-яё0-9_]/gi, '').slice(0, 20);
-        if (!h) { ws.send(JSON.stringify({ type: 'handle_err', reason: 'Слишком короткий или недопустимый' })); break; }
-        if (h.length < 3) { ws.send(JSON.stringify({ type: 'handle_err', reason: 'Минимум 3 символа' })); break; }
-        // Проверяем занятость
-        if (handleIndex[h] && handleIndex[h] !== ws.userId) {
-          ws.send(JSON.stringify({ type: 'handle_err', reason: '@'+h+' уже занят' }));
-          break;
-        }
-        // Освобождаем старый хендл
+        if (!h || h.length < 3) { ws.send(JSON.stringify({ type: 'handle_err', reason: 'Минимум 3 символа' })); break; }
+        if (handleIndex[h] && handleIndex[h] !== ws.userId) { ws.send(JSON.stringify({ type: 'handle_err', reason: '@' + h + ' уже занят' })); break; }
         if (ws.handle && handleIndex[ws.handle] === ws.userId) delete handleIndex[ws.handle];
-        // Устанавливаем новый
         ws.handle = h;
         userHandles[ws.userId] = h;
         handleIndex[h] = ws.userId;
         ws.send(JSON.stringify({ type: 'handle_ok', handle: h }));
+        saveHandles();
         break;
 
-      // ── ПОИСК ──
       case 'find_user':
         var q = (msg.query || '').toLowerCase().replace(/^@/, '');
         var found = null;
-        // По @handle
-        if (handleIndex[q]) {
+        if (handleIndex[q] && handleIndex[q] !== ws.userId) {
           var uid = handleIndex[q];
-          if (uid !== ws.userId) {
-            found = { userId: uid, name: userNames[uid], handle: userHandles[uid] || '', online: !!users[uid] };
-          }
+          found = { userId: uid, name: userNames[uid] || '', handle: userHandles[uid] || '', online: !!users[uid] };
         }
-        // По userId напрямую
-        if (!found && userNames[msg.query] && msg.query !== ws.userId) {
+        if (!found && msg.query !== ws.userId && userNames[msg.query]) {
           found = { userId: msg.query, name: userNames[msg.query], handle: userHandles[msg.query] || '', online: !!users[msg.query] };
         }
-        // По имени (если не нашли)
         if (!found) {
           for (var uid2 in userNames) {
             if (uid2 !== ws.userId && userNames[uid2] && userNames[uid2].toLowerCase() === q) {
@@ -116,19 +129,12 @@ server.on('connection', function(ws) {
         ws.send(JSON.stringify({ type: 'find_result', query: msg.query, user: found }));
         break;
 
-      // ── УВЕДОМЛЕНИЕ ПОЛЬЗОВАТЕЛЮ ──
-      case 'notify':
-        sendTo(msg.toId, { type: 'incoming_msg_notify', fromName: ws.name, fromHandle: ws.handle || '', fromId: ws.userId, preview: (msg.preview || '').slice(0, 60) });
-        break;
-
-      // ── DM ──
       case 'dm':
         var kd = dmKey(ws.userId, msg.toId);
         var dm = { type: 'dm', fromId: ws.userId, toId: msg.toId, name: ws.name, handle: ws.handle || '', text: msg.text, time: msg.time, id: msg.id, replyTo: msg.replyTo || null };
         saveDM(kd, dm);
         ws.send(JSON.stringify(dm));
         sendTo(msg.toId, dm);
-        // Уведомление если офлайн — нет, но если онлайн — шлём push-notify
         sendTo(msg.toId, { type: 'push_notify', fromName: ws.name, fromHandle: ws.handle || '', fromId: ws.userId, preview: (msg.text || '').slice(0, 60) });
         break;
 
@@ -166,21 +172,22 @@ server.on('connection', function(ws) {
       case 'dm_typing':
         sendTo(msg.toId, { type: 'dm_typing', fromId: ws.userId, name: ws.name, isTyping: msg.isTyping, isSending: msg.isSending || false }); break;
 
-      // ── ЗВОНКИ ──
-      case 'call_offer': sendTo(msg.toId, { type: 'call_offer', fromId: ws.userId, fromName: ws.name, fromHandle: ws.handle || '', sdp: msg.sdp, callType: msg.callType || 'audio' }); break;
-      case 'call_answer': sendTo(msg.toId, { type: 'call_answer', fromId: ws.userId, sdp: msg.sdp }); break;
-      case 'call_ice': sendTo(msg.toId, { type: 'call_ice', fromId: ws.userId, candidate: msg.candidate }); break;
-      case 'call_reject': sendTo(msg.toId, { type: 'call_reject', fromId: ws.userId }); break;
-      case 'call_end': sendTo(msg.toId, { type: 'call_end', fromId: ws.userId }); break;
-      case 'group_call_join': if (ws.room) broadcast(ws.room, { type: 'group_call_join', fromId: ws.userId, fromName: ws.name }, ws); break;
-      case 'group_call_offer': sendTo(msg.toId, { type: 'group_call_offer', fromId: ws.userId, fromName: ws.name, sdp: msg.sdp, callType: msg.callType || 'audio' }); break;
-      case 'group_call_answer': sendTo(msg.toId, { type: 'group_call_answer', fromId: ws.userId, sdp: msg.sdp }); break;
-      case 'group_call_ice': sendTo(msg.toId, { type: 'group_call_ice', fromId: ws.userId, candidate: msg.candidate }); break;
-      case 'group_call_leave': if (ws.room) broadcast(ws.room, { type: 'group_call_leave', fromId: ws.userId, fromName: ws.name }, ws); break;
+      case 'call_offer':
+        sendTo(msg.toId, { type: 'call_offer', fromId: ws.userId, fromName: ws.name, fromHandle: ws.handle || '', sdp: msg.sdp, callType: msg.callType || 'audio' }); break;
+      case 'call_answer':
+        sendTo(msg.toId, { type: 'call_answer', fromId: ws.userId, sdp: msg.sdp }); break;
+      case 'call_ice':
+        sendTo(msg.toId, { type: 'call_ice', fromId: ws.userId, candidate: msg.candidate }); break;
+      case 'call_reject':
+        sendTo(msg.toId, { type: 'call_reject', fromId: ws.userId }); break;
+      case 'call_end':
+        sendTo(msg.toId, { type: 'call_end', fromId: ws.userId }); break;
 
-      // ── ГРУППЫ ──
       case 'join':
-        if (ws.room && rooms[ws.room]) { rooms[ws.room].delete(ws); broadcast(ws.room, { type: 'system', room: ws.room, text: (ws.name || '?') + ' вышел из комнаты', members: getMembers(ws.room) }); }
+        if (ws.room && rooms[ws.room]) {
+          rooms[ws.room].delete(ws);
+          broadcast(ws.room, { type: 'system', room: ws.room, text: (ws.name || '?') + ' вышел из комнаты', members: getMembers(ws.room) });
+        }
         ws.room = msg.room; ws.name = msg.name;
         if (!rooms[msg.room]) rooms[msg.room] = new Set();
         rooms[msg.room].add(ws);
@@ -220,10 +227,12 @@ server.on('connection', function(ws) {
       broadcast(ws.room, { type: 'system', room: ws.room, text: (ws.name || '?') + ' вышел из комнаты', members: getMembers(ws.room) });
     }
   });
+
   ws.on('error', function() {
     if (ws.userId) delete users[ws.userId];
     if (ws.room && rooms[ws.room]) rooms[ws.room].delete(ws);
   });
 });
 
+loadHandles();
 console.log('Сервер запущен!');
